@@ -1,5 +1,5 @@
 
-import { Player, MatchStage } from './types';
+import { Player } from './types';
 
 export const TEAMS = [
   'India', 'Australia', 'England', 'South Africa', 

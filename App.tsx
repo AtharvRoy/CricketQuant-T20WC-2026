@@ -1,303 +1,329 @@
 
-import React, { useState, useEffect } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
-import { TEAMS, VENUES, MOCK_PLAYERS } from './constants';
+import React, { useState, useEffect, useMemo } from 'react';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, ResponsiveContainer } from 'recharts';
 import { PredictionEngine } from './services/engine';
-import { PredictionResult, TournamentProbabilities } from './types';
-import { GoogleGenAI } from "@google/genai";
+import { PredictionResult, DiscoveredMatch, LiveMatchState } from './types';
+import { GoogleGenAI, Type } from "@google/genai";
 
 const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'match' | 'tournament' | 'players' | 'specs'>('match');
-  const [teamA, setTeamA] = useState('India');
-  const [teamB, setTeamB] = useState('Australia');
-  const [prediction, setPrediction] = useState<PredictionResult | null>(null);
-  const [analysis, setAnalysis] = useState<string>('');
-  const [loading, setLoading] = useState(false);
+  const [schedule, setSchedule] = useState<DiscoveredMatch[]>([]);
+  const [selectedMatch, setSelectedMatch] = useState<DiscoveredMatch | null>(null);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const [isSearching, setIsSearching] = useState(false);
+  const [analysisText, setAnalysisText] = useState('');
+  const [loadingAnalysis, setLoadingAnalysis] = useState(false);
 
-  useEffect(() => {
-    handlePredict();
-  }, [teamA, teamB]);
+  const ai = useMemo(() => new GoogleGenAI({ apiKey: process.env.API_KEY }), []);
 
-  const handlePredict = () => {
-    setLoading(true);
-    const result = PredictionEngine.predictMatch(teamA, teamB);
-    setPrediction(result);
-    setLoading(false);
+  // Fetch Today's Matches
+  const fetchSchedule = async () => {
+    setIsSearching(true);
+    try {
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-pro-preview',
+        contents: "List all major cricket matches (T20I, domestic T20 leagues) scheduled for today or currently live. Provide data in JSON array format: [{ id, teamA, teamB, venue, status, startTime }]. status must be 'Scheduled' or 'Live'.",
+        config: {
+          tools: [{ googleSearch: {} }],
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                id: { type: Type.STRING },
+                teamA: { type: Type.STRING },
+                teamB: { type: Type.STRING },
+                venue: { type: Type.STRING },
+                status: { type: Type.STRING, enum: ['Scheduled', 'Live'] },
+                startTime: { type: Type.STRING }
+              }
+            }
+          }
+        }
+      });
+      const data = JSON.parse(response.text || '[]') as DiscoveredMatch[];
+      setSchedule(data);
+    } catch (e) {
+      console.error("Failed to fetch schedule", e);
+    } finally {
+      setIsSearching(false);
+    }
   };
 
-  const getGeminiInsight = async () => {
-    if (!prediction) return;
-    setLoading(true);
+  // Sync details for a specific match
+  const syncMatchDetails = async (match: DiscoveredMatch) => {
+    setIsSyncing(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-      const prompt = `Act as a senior cricket analyst. Explain why ${prediction.winner} has a ${Math.round(prediction.winProbability * 100)}% chance to win against ${prediction.winner === teamA ? teamB : teamA} in the 2026 T20WC in India. Mention pitch conditions (spin friendly), xR metrics, and potential for an upset if the risk is ${prediction.upsetRisk}. Keep it concise (3 paragraphs max).`;
       const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
+        model: 'gemini-3-pro-preview',
+        contents: `Find the specific live details for ${match.teamA} vs ${match.teamB} at ${match.venue}. If live, include current score, wickets, overs, and toss winner. If scheduled, confirm venue and expected toss time. Return as JSON.`,
+        config: {
+          tools: [{ googleSearch: {} }],
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              runs: { type: Type.NUMBER },
+              wickets: { type: Type.NUMBER },
+              overs: { type: Type.NUMBER },
+              tossWinner: { type: Type.STRING },
+              status: { type: Type.STRING, enum: ['Scheduled', 'Live', 'Finished'] },
+              liveStatusText: { type: Type.STRING }
+            }
+          }
+        }
+      });
+      const details = JSON.parse(response.text || '{}');
+      setSelectedMatch({ ...match, ...details });
+    } catch (e) {
+      console.error("Match sync failed", e);
+    } finally {
+      setIsSyncing(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchSchedule();
+  }, []);
+
+  const prediction = useMemo(() => {
+    if (!selectedMatch) return null;
+    const state: LiveMatchState = { 
+      currentRuns: selectedMatch.runs || 0, 
+      currentWickets: selectedMatch.wickets || 0, 
+      currentOvers: selectedMatch.overs || 0 
+    };
+    return PredictionEngine.getPrediction(
+      selectedMatch.teamA, 
+      selectedMatch.teamB, 
+      selectedMatch.venue, 
+      selectedMatch.tossWinner, 
+      state
+    );
+  }, [selectedMatch]);
+
+  const getDeepAnalysis = async () => {
+    if (!selectedMatch || !prediction) return;
+    setLoadingAnalysis(true);
+    try {
+      const prompt = `Act as a senior cricket analyst. Breakdown the match between ${selectedMatch.teamA} and ${selectedMatch.teamB} at ${selectedMatch.venue}. 
+      Status: ${selectedMatch.status}. Win Prob: ${(prediction.winProbability * 100).toFixed(1)}% for ${prediction.winner}. 
+      Explain venue impact (${prediction.venueImpact}) and SDE expected total (${prediction.liveProjectedScore}).`;
+      const res = await ai.models.generateContent({
+        model: 'gemini-3-pro-preview',
         contents: prompt
       });
-      setAnalysis(response.text || 'No insights available.');
-    } catch (err) {
-      setAnalysis('Failed to fetch AI insights. Check API key.');
+      setAnalysisText(res.text || '');
+    } catch (e) {
+      setAnalysisText("Could not generate deep analysis at this time.");
     } finally {
-      setLoading(false);
+      setLoadingAnalysis(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-slate-900 text-slate-100 font-sans pb-20">
-      {/* Header */}
-      <header className="bg-slate-800 border-b border-slate-700 p-4 sticky top-0 z-50">
-        <div className="max-w-4xl mx-auto flex justify-between items-center">
-          <h1 className="text-xl font-bold text-orange-500">CricketQuant <span className="text-white">2026</span></h1>
-          <div className="bg-green-600 px-2 py-1 rounded text-xs font-bold animate-pulse">LIVE ENGINE</div>
+    <div className="min-h-screen bg-[#020408] text-slate-100 font-sans selection:bg-orange-500/30">
+      {/* Background Decor */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-orange-600/5 rounded-full blur-[120px]"></div>
+        <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-blue-600/5 rounded-full blur-[120px]"></div>
+      </div>
+
+      <header className="relative z-10 border-b border-white/5 bg-slate-900/20 backdrop-blur-xl p-4 sticky top-0">
+        <div className="max-w-6xl mx-auto flex justify-between items-center">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-orange-600 rounded-xl flex items-center justify-center shadow-lg shadow-orange-500/20 font-black italic text-xl">Q</div>
+            <div>
+              <h1 className="text-lg font-bold tracking-tighter leading-none uppercase">Cricket<span className="text-orange-500">Quant</span></h1>
+              <p className="text-[10px] text-slate-500 font-mono tracking-widest mt-1 uppercase">Today's Forecast Radar</p>
+            </div>
+          </div>
+          
+          <button 
+            onClick={fetchSchedule}
+            disabled={isSearching}
+            className="bg-white text-black px-5 py-2 rounded-full text-[10px] font-black uppercase tracking-widest transition-all hover:scale-105 active:scale-95 disabled:opacity-50"
+          >
+            {isSearching ? 'SEARCHING...' : 'REFRESH SCHEDULE'}
+          </button>
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto p-4 space-y-6">
-        {/* Navigation Tabs */}
-        <nav className="flex bg-slate-800 p-1 rounded-lg overflow-x-auto whitespace-nowrap scrollbar-hide">
-          {(['match', 'tournament', 'players', 'specs'] as const).map(tab => (
-            <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              className={`flex-1 py-2 px-4 rounded-md text-sm font-medium transition-colors ${
-                activeTab === tab ? 'bg-orange-600 text-white shadow-lg' : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              {tab.toUpperCase()}
-            </button>
-          ))}
-        </nav>
-
-        {activeTab === 'match' && (
-          <div className="space-y-6 animate-fadeIn">
-            {/* Match Selector */}
-            <div className="grid grid-cols-2 gap-4 bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-xl">
-              <div className="space-y-2">
-                <label className="text-xs text-slate-400 uppercase tracking-widest">Team A</label>
-                <select 
-                  value={teamA} 
-                  onChange={(e) => setTeamA(e.target.value)}
-                  className="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white focus:outline-none focus:ring-2 focus:ring-orange-500"
-                >
-                  {TEAMS.map(t => <option key={t} value={t}>{t}</option>)}
-                </select>
+      <main className="relative z-10 max-w-6xl mx-auto p-4 md:p-8">
+        
+        {/* Schedule Grid */}
+        {!selectedMatch && (
+          <div className="space-y-6">
+            <h2 className="text-sm font-black text-slate-500 uppercase tracking-[0.3em] mb-8">Matches for Today</h2>
+            {isSearching ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {[1,2,3].map(i => <div key={i} className="h-48 bg-slate-900/40 rounded-[32px] border border-white/5 animate-pulse" />)}
               </div>
-              <div className="space-y-2 text-right">
-                <label className="text-xs text-slate-400 uppercase tracking-widest">Team B</label>
-                <select 
-                  value={teamB} 
-                  onChange={(e) => setTeamB(e.target.value)}
-                  className="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white focus:outline-none focus:ring-2 focus:ring-orange-500"
-                >
-                  {TEAMS.map(t => <option key={t} value={t}>{t}</option>)}
-                </select>
+            ) : schedule.length > 0 ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                {schedule.map(match => (
+                  <button 
+                    key={match.id} 
+                    onClick={() => { setSelectedMatch(match); syncMatchDetails(match); }}
+                    className="group bg-slate-900/40 border border-white/5 hover:border-orange-500/50 p-6 rounded-[32px] text-left transition-all hover:translate-y-[-4px] shadow-xl"
+                  >
+                    <div className="flex justify-between items-center mb-4">
+                      <span className={`text-[9px] font-black px-2 py-0.5 rounded-full uppercase tracking-widest ${match.status === 'Live' ? 'bg-red-500 text-white animate-pulse' : 'bg-slate-800 text-slate-400'}`}>
+                        {match.status}
+                      </span>
+                      <span className="text-[10px] font-mono text-slate-600">{match.startTime}</span>
+                    </div>
+                    <div className="text-xl font-black mb-1 leading-tight">{match.teamA}</div>
+                    <div className="text-xs font-bold text-slate-600 mb-1 italic">vs</div>
+                    <div className="text-xl font-black mb-4 leading-tight">{match.teamB}</div>
+                    <div className="pt-4 border-t border-white/5 text-[10px] text-slate-500 font-bold uppercase truncate">
+                      📍 {match.venue}
+                    </div>
+                  </button>
+                ))}
               </div>
-            </div>
-
-            {/* Prediction Results */}
-            {prediction && (
-              <div className="space-y-6">
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  <div className="bg-slate-800 p-4 rounded-xl border-l-4 border-orange-600 shadow-md">
-                    <p className="text-xs text-slate-400 uppercase">Predicted Winner</p>
-                    <p className="text-2xl font-black text-white">{prediction.winner}</p>
-                    <p className="text-sm text-orange-400 font-bold">{(prediction.winProbability * 100).toFixed(1)}% Win Prob</p>
-                  </div>
-                  <div className="bg-slate-800 p-4 rounded-xl border-l-4 border-blue-500 shadow-md">
-                    <p className="text-xs text-slate-400 uppercase">Expected Score (Inn 1)</p>
-                    <p className="text-2xl font-black text-white">{prediction.expectedTotal.toFixed(0)}</p>
-                    <p className="text-sm text-blue-400 font-bold">xR Analysis</p>
-                  </div>
-                  <div className="bg-slate-800 p-4 rounded-xl border-l-4 border-red-500 shadow-md">
-                    <p className="text-xs text-slate-400 uppercase">Upset Risk</p>
-                    <p className={`text-2xl font-black ${prediction.upsetRisk === 'High' ? 'text-red-500' : prediction.upsetRisk === 'Medium' ? 'text-yellow-500' : 'text-green-500'}`}>
-                      {prediction.upsetRisk}
-                    </p>
-                    <p className="text-sm text-slate-400">Monte Carlo Sim</p>
-                  </div>
-                </div>
-
-                {/* WP Chart */}
-                <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
-                  <h3 className="text-sm font-bold text-slate-400 mb-4 uppercase tracking-tighter">Win Probability Evolution (SDE Projection)</h3>
-                  <div className="h-64 w-full">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={prediction.wpCurve}>
-                        <defs>
-                          <linearGradient id="colorWp" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor="#f97316" stopOpacity={0.3}/>
-                            <stop offset="95%" stopColor="#f97316" stopOpacity={0}/>
-                          </linearGradient>
-                        </defs>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                        <XAxis dataKey="overs" stroke="#94a3b8" label={{ value: 'Overs', position: 'insideBottom', offset: -5 }} />
-                        <YAxis stroke="#94a3b8" domain={[0, 1]} tickFormatter={(val) => `${(val * 100).toFixed(0)}%`} />
-                        <Tooltip 
-                          contentStyle={{ backgroundColor: '#1e293b', border: 'none', borderRadius: '8px' }}
-                          labelStyle={{ color: '#94a3b8' }}
-                        />
-                        <Area type="monotone" dataKey="teamAWP" stroke="#f97316" fillOpacity={1} fill="url(#colorWp)" strokeWidth={3} name={teamA} />
-                      </AreaChart>
-                    </ResponsiveContainer>
-                  </div>
-                </div>
-
-                {/* AI Analysis */}
-                <div className="bg-slate-800 p-6 rounded-xl border border-slate-700">
-                   <div className="flex justify-between items-center mb-4">
-                    <h3 className="text-sm font-bold text-slate-400 uppercase">Strategic AI Insight</h3>
-                    <button 
-                      onClick={getGeminiInsight} 
-                      disabled={loading}
-                      className="text-xs bg-orange-600 hover:bg-orange-700 px-3 py-1 rounded transition-colors disabled:opacity-50"
-                    >
-                      {loading ? 'Analyzing...' : 'Generate Insight'}
-                    </button>
-                   </div>
-                   {analysis ? (
-                     <p className="text-slate-300 leading-relaxed text-sm whitespace-pre-wrap">{analysis}</p>
-                   ) : (
-                     <p className="text-slate-500 italic text-sm">Click 'Generate Insight' for deep technical analysis of this matchup.</p>
-                   )}
-                </div>
+            ) : (
+              <div className="text-center py-20 bg-slate-900/20 rounded-[40px] border border-dashed border-white/10">
+                <p className="text-slate-500 text-sm font-bold">No major matches found for today.</p>
               </div>
             )}
           </div>
         )}
 
-        {activeTab === 'tournament' && (
-          <div className="space-y-6 animate-fadeIn">
-            <div className="bg-slate-800 rounded-xl overflow-hidden border border-slate-700 shadow-xl">
-              <table className="w-full text-left text-sm">
-                <thead className="bg-slate-700 text-slate-300 uppercase text-xs">
-                  <tr>
-                    <th className="px-4 py-3">Team</th>
-                    <th className="px-4 py-3">Super 8 %</th>
-                    <th className="px-4 py-3">Semi %</th>
-                    <th className="px-4 py-3">Final %</th>
-                    <th className="px-4 py-3 text-orange-500">Win %</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-700">
-                  {MOCK_TOURNAMENT_PROBS.map((tp, idx) => (
-                    <tr key={tp.team} className="hover:bg-slate-750 transition-colors">
-                      <td className="px-4 py-4 font-bold flex items-center gap-2">
-                        <span className="text-slate-500">#{idx+1}</span>
-                        {tp.team}
-                      </td>
-                      <td className="px-4 py-4">{(tp.super8 * 100).toFixed(0)}%</td>
-                      <td className="px-4 py-4">{(tp.semi * 100).toFixed(0)}%</td>
-                      <td className="px-4 py-4">{(tp.final * 100).toFixed(0)}%</td>
-                      <td className="px-4 py-4 font-black text-orange-500">{(tp.win * 100).toFixed(1)}%</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <p className="text-xs text-slate-500 text-center uppercase tracking-widest italic">Based on 10,000 Monte Carlo Simulations of the 2026 Schedule</p>
-          </div>
-        )}
+        {/* Selected Match Analysis */}
+        {selectedMatch && prediction && (
+          <div className="space-y-8 animate-fadeIn">
+            {/* Back Button */}
+            <button onClick={() => { setSelectedMatch(null); setAnalysisText(''); }} className="text-[10px] font-black text-slate-500 hover:text-white uppercase tracking-widest flex items-center gap-2">
+              ← Back to Schedule
+            </button>
 
-        {activeTab === 'players' && (
-          <div className="space-y-6 animate-fadeIn">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {MOCK_PLAYERS.map(player => (
-                <div key={player.id} className="bg-slate-800 p-5 rounded-xl border border-slate-700 flex justify-between items-center group hover:border-orange-500 transition-all">
-                  <div>
-                    <h4 className="font-bold text-white text-lg">{player.name}</h4>
-                    <p className="text-xs text-slate-400 uppercase">{player.team} • {player.role}</p>
-                    <div className="flex gap-4 mt-3">
-                      <div className="text-center">
-                        <p className="text-xs text-slate-500">xR/Ball</p>
-                        <p className="text-orange-500 font-black">{player.expectedRunsPerBall}</p>
-                      </div>
-                      <div className="text-center">
-                        <p className="text-xs text-slate-500">xW/Ball</p>
-                        <p className="text-blue-500 font-black">{player.expectedWicketsPerBall}</p>
-                      </div>
-                      <div className="text-center">
-                        <p className="text-xs text-slate-500">Form</p>
-                        <p className="text-green-500 font-black">{(player.formIndex * 100).toFixed(0)}</p>
+            {/* Main Dashboard */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+              
+              {/* Prediction Center */}
+              <div className="lg:col-span-8 space-y-6">
+                <div className="bg-slate-900 border border-white/10 rounded-[40px] p-8 md:p-12 shadow-2xl relative overflow-hidden">
+                  <div className="flex justify-between items-start mb-8">
+                    <div>
+                      <span className="text-[10px] font-black text-orange-500 uppercase tracking-[0.3em]">
+                        {selectedMatch.status === 'Live' ? 'Live Win Probability' : 'Pre-Match Forecast'}
+                      </span>
+                      <h2 className="text-6xl md:text-8xl font-black text-white tracking-tighter mt-2">
+                        {(prediction.winProbability * 100).toFixed(0)}<span className="text-orange-500">%</span>
+                      </h2>
+                      <p className="text-lg font-bold text-slate-400 mt-2">Favorite: <span className="text-white underline decoration-orange-500">{prediction.winner}</span></p>
+                    </div>
+                    <div className="text-right">
+                      <button onClick={() => syncMatchDetails(selectedMatch)} disabled={isSyncing} className="text-[10px] font-black text-blue-500 uppercase hover:text-blue-400">
+                        {isSyncing ? 'SYNCING...' : 'FORCE RE-SYNC'}
+                      </button>
+                      <div className="mt-4 text-[10px] font-mono text-slate-500 space-y-1">
+                        <div>VENUE: {selectedMatch.venue.toUpperCase()}</div>
+                        <div>TOSS: {selectedMatch.tossWinner?.toUpperCase() || 'PENDING'}</div>
                       </div>
                     </div>
                   </div>
-                  <div className="w-16 h-16 bg-slate-700 rounded-full flex items-center justify-center text-2xl border-2 border-slate-600 group-hover:border-orange-500 transition-colors">
-                    {player.name[0]}
+
+                  {/* Run Breakdown */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 py-8 border-y border-white/5">
+                    <div className="space-y-1">
+                      <p className="text-[9px] font-black text-slate-500 uppercase">Venue Adjusted xR</p>
+                      <p className="text-2xl font-black">{prediction.breakdown.venueBase}</p>
+                      <p className="text-[9px] text-slate-600 font-bold uppercase">{prediction.venueImpact}</p>
+                    </div>
+                    <div className="space-y-1">
+                      <p className="text-[9px] font-black text-slate-500 uppercase">Team Strength Multiplier</p>
+                      <p className="text-2xl font-black text-orange-500">x{prediction.breakdown.teamStrengthMod}</p>
+                      <p className="text-[9px] text-slate-600 font-bold uppercase">Elo-Based Drift</p>
+                    </div>
+                    <div className="space-y-1">
+                      <p className="text-[9px] font-black text-slate-500 uppercase">Expected Score (SDE)</p>
+                      <p className="text-2xl font-black text-white">{prediction.liveProjectedScore}</p>
+                      <p className="text-[9px] text-slate-600 font-bold uppercase">Mean Projected Total</p>
+                    </div>
+                  </div>
+
+                  {/* Live Status If Active */}
+                  {selectedMatch.status === 'Live' && (
+                    <div className="mt-8 p-6 bg-red-500/5 border border-red-500/20 rounded-3xl flex justify-between items-center">
+                      <div>
+                        <p className="text-[9px] font-black text-red-500 uppercase mb-1">Live Match Progress</p>
+                        <p className="text-2xl font-black text-white">{selectedMatch.runs}/{selectedMatch.wickets} <span className="text-sm text-slate-500">({selectedMatch.overs} ov)</span></p>
+                      </div>
+                      <div className="text-right text-xs font-bold text-slate-400">
+                        {selectedMatch.liveStatusText}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="h-32 mt-12">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={prediction.wpCurve}>
+                        <Area type="monotone" dataKey="teamAWP" stroke="#f97316" fill="#f9731633" strokeWidth={3} isAnimationActive={false} />
+                      </AreaChart>
+                    </ResponsiveContainer>
                   </div>
                 </div>
-              ))}
+              </div>
+
+              {/* Side: Detailed Analysis */}
+              <div className="lg:col-span-4 space-y-6">
+                <div className="bg-slate-900 border border-white/5 p-8 rounded-[40px] shadow-xl h-full flex flex-col">
+                  <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest mb-6">Strategic Breakdown</h3>
+                  
+                  <div className="flex-1 space-y-6">
+                    {!analysisText && !loadingAnalysis && (
+                      <button 
+                        onClick={getDeepAnalysis} 
+                        className="w-full bg-white/5 border border-white/10 hover:bg-white/10 py-8 rounded-3xl text-xs font-bold text-slate-400 transition-all"
+                      >
+                        Click to generate deep predictive analysis
+                      </button>
+                    )}
+                    
+                    {loadingAnalysis && (
+                      <div className="space-y-4 animate-pulse">
+                        <div className="h-4 bg-slate-800 rounded w-3/4"></div>
+                        <div className="h-4 bg-slate-800 rounded w-full"></div>
+                        <div className="h-4 bg-slate-800 rounded w-5/6"></div>
+                      </div>
+                    )}
+
+                    {analysisText && (
+                      <div className="prose prose-invert prose-sm text-slate-400 font-medium leading-relaxed italic">
+                        {analysisText}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="pt-8 border-t border-white/5 mt-8">
+                    <p className="text-[9px] font-black text-slate-600 uppercase mb-4 tracking-tighter underline">Model Parameters</p>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <p className="text-[8px] font-black text-slate-700 uppercase">Solver</p>
+                        <p className="text-[10px] font-bold text-slate-500">Euler-Maruyama</p>
+                      </div>
+                      <div>
+                        <p className="text-[8px] font-black text-slate-700 uppercase">Simulations</p>
+                        <p className="text-[10px] font-bold text-slate-500">1,000 Iterations</p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
             </div>
           </div>
         )}
 
-        {activeTab === 'specs' && (
-          <div className="space-y-6 animate-fadeIn bg-slate-800 p-6 rounded-xl border border-slate-700 text-slate-300">
-            <h2 className="text-xl font-bold text-orange-500 mb-4">Technical Specs & SDE Formula</h2>
-            
-            <section className="space-y-3">
-              <h3 className="text-white font-bold text-sm uppercase">SDE Scoring Equation</h3>
-              <div className="bg-slate-900 p-4 rounded font-mono text-sm border border-slate-700">
-                dRₜ = μ(t, Wₜ, P)dt + σ(t)dBₜ<br/>
-                dWₜ = Poisson(λ(t, P))dt
-              </div>
-              <p className="text-xs italic">μ = Team scoring drift, σ = scoring volatility, Bₜ = Brownian motion, Wₜ = Wicket state process.</p>
-            </section>
-
-            <section className="space-y-3">
-              <h3 className="text-white font-bold text-sm uppercase">API Endpoints (Python Ready)</h3>
-              <ul className="text-xs space-y-2 list-disc list-inside">
-                <li><code className="bg-slate-900 px-1 rounded text-orange-400">GET /predict/match?tA={teamA}&tB={teamB}</code> - Returns win probability and xR.</li>
-                <li><code className="bg-slate-900 px-1 rounded text-orange-400">POST /simulate/tournament</code> - Runs 10k Monte Carlo sims using SDE core.</li>
-                <li><code className="bg-slate-900 px-1 rounded text-orange-400">GET /player/{'{id}'}/impact</code> - Returns actual vs expected metrics.</li>
-              </ul>
-            </section>
-
-            <section className="space-y-3">
-              <h3 className="text-white font-bold text-sm uppercase">Data Schema</h3>
-              <div className="bg-slate-900 p-4 rounded font-mono text-xs overflow-x-auto">
-                <pre>{`
-TABLE deliveries (
-  match_id UUID,
-  ball_num FLOAT,
-  batter_id UUID,
-  bowler_id UUID,
-  line_length VARCHAR,
-  expected_runs FLOAT, -- xR
-  actual_runs INT,
-  expected_wicket FLOAT, -- xW
-  is_wicket BOOLEAN
-);
-                `}</pre>
-              </div>
-            </section>
-          </div>
-        )}
       </main>
 
-      {/* Mobile Footer Navigation Placeholder */}
-      <footer className="fixed bottom-0 left-0 right-0 bg-slate-800 border-t border-slate-700 p-2 flex justify-around items-center md:hidden">
-         <div className="text-center">
-            <div className="w-1 h-1 bg-orange-500 rounded-full mx-auto mb-1"></div>
-            <p className="text-[10px] text-slate-300">Dashboard</p>
-         </div>
-         <div className="text-center opacity-50">
-            <p className="text-[10px] text-slate-300">Live</p>
-         </div>
-         <div className="text-center opacity-50">
-            <p className="text-[10px] text-slate-300">Settings</p>
-         </div>
+      <footer className="fixed bottom-0 left-0 right-0 p-4 bg-slate-950/80 backdrop-blur-md border-t border-white/5 text-center text-[8px] text-slate-600 font-mono tracking-[0.4em] uppercase z-40">
+        Data: Google Search Grounding • Model: CricketQuant-SDE-V4 • Real-time Sync Active
       </footer>
     </div>
   );
 };
-
-const MOCK_TOURNAMENT_PROBS: TournamentProbabilities[] = [
-  { team: 'India', super8: 0.98, semi: 0.75, final: 0.45, win: 0.28 },
-  { team: 'Australia', super8: 0.95, semi: 0.68, final: 0.40, win: 0.22 },
-  { team: 'South Africa', super8: 0.88, semi: 0.55, final: 0.30, win: 0.15 },
-  { team: 'England', super8: 0.92, semi: 0.60, final: 0.25, win: 0.12 },
-  { team: 'Afghanistan', super8: 0.70, semi: 0.35, final: 0.10, win: 0.05 },
-];
 
 export default App;

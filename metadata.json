@@ -1,5 +1,7 @@
 {
   "name": "CricketQuant T20WC 2026",
-  "description": "High-accuracy T20 cricket prediction engine using SDE-based win-probability modeling and NFL-style expected-runs (xR) analytics.",
-  "requestFramePermissions": []
+  "description": "High-accuracy T20 cricket prediction engine using SDE-based win-probability modeling and schedule-aware live sync.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
 }

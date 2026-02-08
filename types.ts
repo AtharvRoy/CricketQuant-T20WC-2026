@@ -1,48 +1,46 @@
 
-export enum MatchStage {
-  GROUP = 'Group Stage',
-  SUPER8 = 'Super 8',
-  SEMIFINAL = 'Semi-Final',
-  FINAL = 'Final'
-}
-
 export interface Player {
   id: string;
   name: string;
   team: string;
   role: 'Batter' | 'Bowler' | 'All-rounder';
-  expectedRunsPerBall: number; // xR
-  expectedWicketsPerBall: number; // xW
-  formIndex: number; // 0-1
+  expectedRunsPerBall: number;
+  expectedWicketsPerBall: number;
+  formIndex: number;
 }
 
-export interface MatchState {
-  overs: number;
-  runs: number;
-  wickets: number;
+export interface LiveMatchState {
+  currentRuns: number;
+  currentWickets: number;
+  currentOvers: number;
   target?: number;
-  battingTeam: string;
-  bowlingTeam: string;
 }
 
-export interface WPPoint {
-  overs: number;
-  teamAWP: number;
-  teamBWP: number;
-}
-
-export interface TournamentProbabilities {
-  team: string;
-  super8: number;
-  semi: number;
-  final: number;
-  win: number;
+export interface DiscoveredMatch {
+  id: string;
+  teamA: string;
+  teamB: string;
+  venue: string;
+  status: 'Scheduled' | 'Live' | 'Finished';
+  startTime?: string;
+  runs?: number;
+  wickets?: number;
+  overs?: number;
+  tossWinner?: string;
+  liveStatusText?: string;
 }
 
 export interface PredictionResult {
   winner: string;
   winProbability: number;
   expectedTotal: number;
-  upsetRisk: 'Low' | 'Medium' | 'High';
-  wpCurve: WPPoint[];
+  liveProjectedScore: number;
+  upsetRisk: 'Low' | 'Medium' | 'High' | 'Extreme';
+  wpCurve: { overs: number; teamAWP: number }[];
+  venueImpact: string;
+  breakdown: {
+    venueBase: number;
+    teamStrengthMod: number;
+    tossAdvantage: number;
+  };
 }

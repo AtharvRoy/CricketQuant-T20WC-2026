@@ -1,85 +1,105 @@
 
-import { MatchState, WPPoint, PredictionResult } from '../types';
-
-/**
- * Cricket SDE Modeling Logic
- * -------------------------
- * We treat the score R(t) as a stochastic process:
- * dR_t = μ(t, W_t, Players)dt + σ(t)dB_t
- * Where:
- * - μ is the expected run rate (drift)
- * - σ is the volatility (variance in scoring)
- * - W_t is the wicket state process (jumps)
- */
+import { LiveMatchState, PredictionResult, Player } from '../types';
+import { MOCK_PLAYERS, VENUES } from '../constants';
 
 export class PredictionEngine {
-  private static simulateInnings(
-    startState: MatchState, 
-    teamStrength: number, 
-    volatility: number = 0.5
-  ): { finalRuns: number; path: { overs: number; runs: number; wickets: number }[] } {
-    let currentRuns = startState.runs;
-    let currentWickets = startState.wickets;
-    let path = [{ overs: startState.overs, runs: currentRuns, wickets: currentWickets }];
-    
-    // Euler-Maruyama discretization (simulating ball-by-ball or over-by-over)
-    const dt = 1/6; // one ball
-    for (let t = startState.overs; t < 20; t += dt) {
-      if (currentWickets >= 10) break;
+  private static STRENGTHS: Record<string, number> = {
+    'India': 9.2, 'Australia': 8.9, 'England': 8.6, 'South Africa': 8.4, 
+    'Pakistan': 8.0, 'New Zealand': 8.2, 'West Indies': 7.8, 'Afghanistan': 7.5,
+    'Sri Lanka': 7.7, 'Bangladesh': 7.0, 'USA': 6.0, 'Netherlands': 6.5
+  };
 
-      // Drift calculation (influenced by team strength and remaining wickets)
-      const wicketPressure = (10 - currentWickets) / 10;
-      const drift = teamStrength * wicketPressure * dt;
-      
-      // Diffusion/Stochastic component
-      const noise = (Math.random() - 0.5) * volatility * Math.sqrt(dt);
-      
-      // Poisson-style wicket check
-      const wicketProb = 0.04 * (1 + (20 - t) / 20); // Higher risk at the end
-      if (Math.random() < wicketProb * dt * 6) {
-        currentWickets++;
-      }
-
-      currentRuns += Math.max(0, drift + noise * 6); // Scale noise back to runs
-      path.push({ overs: Math.min(20, t + dt), runs: Math.floor(currentRuns), wickets: currentWickets });
-    }
-
-    return { finalRuns: Math.floor(currentRuns), path };
+  private static getFormMultiplier(team: string): number {
+    const players = MOCK_PLAYERS.filter(p => p.team === team);
+    if (!players.length) return 1.0;
+    const avg = players.reduce((sum, p) => sum + p.formIndex, 0) / players.length;
+    return 0.95 + (avg * 0.1);
   }
 
-  public static predictMatch(teamA: string, teamB: string): PredictionResult {
-    const iterations = 500;
-    let teamAWins = 0;
-    let totalTeamARuns = 0;
-    
-    // Simple strength map for demo
-    const strengths: Record<string, number> = { 'India': 8.5, 'Australia': 8.3, 'England': 8.1, 'Afghanistan': 7.2 };
-    const sA = strengths[teamA] || 7.5;
-    const sB = strengths[teamB] || 7.5;
+  private static findVenueModifier(venueName: string): number {
+    const venue = VENUES.find(v => 
+      venueName.toLowerCase().includes(v.name.toLowerCase()) || 
+      venueName.toLowerCase().includes(v.city.toLowerCase())
+    );
+    return venue ? venue.xR_Modifier : 1.0;
+  }
+
+  private static simulateToEnd(
+    state: LiveMatchState,
+    team: string,
+    venueMod: number,
+    hasToss: boolean,
+    iterations: number = 1000
+  ): number[] {
+    const base = this.STRENGTHS[team] || 7.0;
+    const form = this.getFormMultiplier(team);
+    const tossBias = hasToss ? 1.05 : 1.0;
+    const mu = base * venueMod * form * tossBias;
+    const sigma = 0.7;
+    const results: number[] = [];
 
     for (let i = 0; i < iterations; i++) {
-      const inn1 = this.simulateInnings({ overs: 0, runs: 0, wickets: 0, battingTeam: teamA, bowlingTeam: teamB }, sA);
-      const inn2 = this.simulateInnings({ overs: 0, runs: 0, wickets: 0, battingTeam: teamB, bowlingTeam: teamA }, sB);
-      
-      totalTeamARuns += inn1.finalRuns;
-      if (inn1.finalRuns > inn2.finalRuns) teamAWins++;
+      let r = state.currentRuns;
+      let w = state.currentWickets;
+      const dt = 1/6;
+
+      for (let t = state.currentOvers; t < 20; t += dt) {
+        if (w >= 10) break;
+        const wicketProb = 0.04 * (1 + (t / 20)); 
+        if (Math.random() < wicketProb) {
+          w++;
+          continue;
+        }
+        const noise = (Math.random() - 0.5) * sigma;
+        const drift = (mu / 6) * ((10 - w) / 10);
+        r += Math.max(0, drift + noise);
+      }
+      results.push(Math.floor(r));
+    }
+    return results;
+  }
+
+  public static getPrediction(
+    teamA: string,
+    teamB: string,
+    venueName: string,
+    tossWinner: string | undefined,
+    liveState: LiveMatchState
+  ): PredictionResult {
+    const venueMod = this.findVenueModifier(venueName);
+    const hasToss = tossWinner === teamA;
+    
+    const simA = this.simulateToEnd(liveState, teamA, venueMod, hasToss);
+    const simB = this.simulateToEnd({ currentRuns: 0, currentWickets: 0, currentOvers: 0 }, teamB, venueMod, tossWinner === teamB);
+
+    const avgA = simA.reduce((a, b) => a + b, 0) / simA.length;
+    const avgB = simB.reduce((a, b) => a + b, 0) / simB.length;
+
+    let aWins = 0;
+    for (let i = 0; i < 1000; i++) {
+      if (simA[i] > simB[i]) aWins++;
     }
 
-    const winProb = teamAWins / iterations;
-    
-    // Generate WP Curve (Conceptual)
-    const wpCurve: WPPoint[] = Array.from({ length: 21 }, (_, i) => ({
-      overs: i,
-      teamAWP: Math.max(0.1, Math.min(0.9, winProb + (Math.random() - 0.5) * 0.1)),
-      teamBWP: 1 - Math.max(0.1, Math.min(0.9, winProb + (Math.random() - 0.5) * 0.1))
-    }));
+    const winProb = aWins / 1000;
+    const strengthA = this.STRENGTHS[teamA] || 7.0;
+    const strengthB = this.STRENGTHS[teamB] || 7.0;
 
     return {
       winner: winProb > 0.5 ? teamA : teamB,
       winProbability: winProb > 0.5 ? winProb : 1 - winProb,
-      expectedTotal: totalTeamARuns / iterations,
-      upsetRisk: winProb > 0.3 && winProb < 0.7 ? 'Medium' : 'Low',
-      wpCurve
+      expectedTotal: avgA,
+      liveProjectedScore: Math.floor(avgA),
+      upsetRisk: Math.abs(strengthA - strengthB) > 1.2 && winProb > 0.4 ? 'High' : 'Low',
+      venueImpact: venueMod > 1.0 ? 'Batting Friendly' : venueMod < 1.0 ? 'Bowling Friendly' : 'Neutral',
+      wpCurve: Array.from({ length: 21 }, (_, i) => ({
+        overs: i,
+        teamAWP: Math.max(0, Math.min(1, winProb + (Math.random() - 0.5) * 0.1))
+      })),
+      breakdown: {
+        venueBase: Math.floor(160 * venueMod),
+        teamStrengthMod: Number((strengthA / 8).toFixed(2)),
+        tossAdvantage: hasToss ? 1.05 : 1.0
+      }
     };
   }
 }
